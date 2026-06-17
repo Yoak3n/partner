@@ -66,7 +66,7 @@ impl Runtime {
         let available_skills = &self.available_skills;
         let process_manager = &self.process_manager;
         let subagent_registry = &self.subagent_registry;
-        let conversation_id = &self.conversation_id;
+        let session_id = &self.session_id;
         let message_history = &self.conversation.messages;
         let app_config = &self.app_config;
         let builtin_futures: Vec<_> = builtin_calls
@@ -90,7 +90,7 @@ impl Runtime {
                             .as_str()
                             .unwrap_or("");
                         let ctx = SubAgentContext {
-                            conversation_id,
+                            session_id,
                             message_history,
                             available_skills,
                             app_config,
@@ -141,7 +141,7 @@ impl Runtime {
             let tool_msg = Message::tool_result(&call.id, &result);
             self.conversation.push(tool_msg.clone());
             let order = self.conversation.messages.len() as i64 - 1;
-            let _ = self.storage.save_message(&self.conversation_id, &tool_msg, order);
+            let _ = self.storage.save_message(&self.session_id, &self.conversation_id, &tool_msg, order);
         }
 
         if round == max_rounds - 1 {

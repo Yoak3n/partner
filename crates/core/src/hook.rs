@@ -19,7 +19,7 @@ pub enum HookResult {
 pub struct HookContext<'a> {
     pub provider: &'a ModelProvider,
     pub round: usize,
-    pub conversation_id: &'a str,
+    pub session_id: &'a str,
 }
 
 /// Agent hook trait，所有方法都有默认空实现，用户按需覆盖

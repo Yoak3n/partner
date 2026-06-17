@@ -6,11 +6,15 @@ edition = "2024"
 [dependencies]
 ai-partner-shared = { path = "../shared" }
 ai-partner-core = { path = "../core" }
-iced = { version = "0.14", features = ["tokio", "image"] }
+iced = { version = "0.14", default-features = false, features = ["tokio", "image", "tiny-skia", "crisp", "web-colors", "thread-pool", "linux-theme-detection", "wayland"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 tray-icon = "0.24.1"
 muda = "0.19.3"
+image = "0.25"
+
+[target.'cfg(not(windows))'.dependencies]
+gtk = "0.18"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = ["Win32_Graphics_Dwm", "Win32_UI_WindowsAndMessaging"] }

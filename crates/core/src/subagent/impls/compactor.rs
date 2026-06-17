@@ -134,7 +134,7 @@ impl AgentHook for CompactionHook {
 
         let prompt = self.manager.build_compaction_prompt(&evicted);
         let sub_ctx = SubAgentContext {
-            conversation_id: ctx.conversation_id,
+            session_id: ctx.session_id,
             message_history: &[],
             available_skills: &[],
             app_config: &self.app_config,
@@ -156,7 +156,7 @@ impl AgentHook for CompactionHook {
         if let Err(e) = self
             .manager
             .storage_ref()
-            .delete_messages_before(ctx.conversation_id, boundary)
+            .delete_messages_before(ctx.session_id, boundary)
         {
             log::warn!("failed to delete compacted messages: {e}");
         }

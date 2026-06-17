@@ -15,25 +15,37 @@ impl Runtime {
     pub async fn send_message(&mut self, content: impl Into<String>) {
         // Load conversation history from DB if this is a fresh in-memory state
         if self.conversation.messages.is_empty() {
-            match self.conversation_manager.load_recent(&self.conversation_id) {
+            match self.conversation_manager.load_recent(&self.session_id) {
                 Ok(history) if !history.is_empty() => {
-                    log::info!("loaded {} messages from conversation history", history.len());
+                    log::info!("loaded {} messages from session history", history.len());
                     for msg in history {
                         self.conversation.push(msg);
                     }
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    log::warn!("failed to load conversation history: {e}");
+                    log::warn!("failed to load session history: {e}");
                 }
             }
         }
 
         let content = content.into();
         let user_msg = Message::user(&content);
+
+        // Start a new conversation for each agent loop
+        self.ensure_new_conversation();
+
+        // Ensure session exists in DB, save first message
+        self.ensure_session_exists(Some(&content));
+
         self.conversation.push(user_msg.clone());
         let order = self.conversation.messages.len() as i64 - 1;
-        let _ = self.storage.save_message(&self.conversation_id, &user_msg, order);
+        let _ = self.storage.save_message(&self.session_id, &self.conversation_id, &user_msg, order);
+        // Also write user message to session file immediately
+        let _ = self.storage.save_session_file(
+            &self.session_id,
+            &self.conversation.messages,
+        );
 
         self.active_skills = self
             .skill_selector
@@ -119,11 +131,11 @@ impl Runtime {
             self.state = AgentState::Thinking;
             let mut messages = self.build_llm_messages();
 
-            let conv_id = self.conversation_id.clone();
+            let sess_id = self.session_id.clone();
             let ctx = HookContext {
                 provider: &provider,
                 round,
-                conversation_id: &conv_id,
+                session_id: &sess_id,
             };
 
             match self.run_hooks_before_llm(&ctx, &mut messages).await {
@@ -165,7 +177,12 @@ impl Runtime {
                 AgentResponse::MessageComplete(msg) => {
                     self.conversation.push(msg.clone());
                     let order = self.conversation.messages.len() as i64 - 1;
-                    let _ = self.storage.save_message(&self.conversation_id, &msg, order);
+                    let _ = self.storage.save_message(&self.session_id, &self.conversation_id, &msg, order);
+                    // Save full session history to file (for UI rendering)
+                    let _ = self.storage.save_session_file(
+                        &self.session_id,
+                        &self.conversation.messages,
+                    );
                     self.generate_and_store_summary();
                     self.state = AgentState::Idle;
                     return;
@@ -174,7 +191,7 @@ impl Runtime {
                     let assistant_msg = Message::assistant_tool_calls(calls.clone());
                     self.conversation.push(assistant_msg.clone());
                     let order = self.conversation.messages.len() as i64 - 1;
-                    let _ = self.storage.save_message(&self.conversation_id, &assistant_msg, order);
+                    let _ = self.storage.save_message(&self.session_id, &self.conversation_id, &assistant_msg, order);
 
                     let result = self.execute_tool_calls(&ctx, &calls, round, max_rounds).await;
                     match result {
@@ -211,8 +228,10 @@ impl Runtime {
 
     fn select_provider(&self) -> Option<&ModelProvider> {
         let group = self.app_config.group(ModelKind::Chat);
+        eprintln!("[provider] active: {:?}, providers: {}", group.active, group.providers.len());
         if let Some(ref active_id) = group.active {
             if let Some(p) = group.providers.iter().find(|p| &p.id == active_id) {
+                eprintln!("[provider] found active: {} ({})", p.name, p.base_url);
                 if p.enabled {
                     return Some(p);
                 }
@@ -222,10 +241,12 @@ impl Runtime {
         for _ in 0..self.balancer.providers().len() {
             if let Some(provider) = self.balancer.select() {
                 if self.rate_limiter.is_available(provider) {
+                    eprintln!("[provider] using balancer: {} ({})", provider.name, provider.base_url);
                     return Some(provider);
                 }
             }
         }
+        eprintln!("[provider] no provider available!");
         None
     }
 
@@ -239,7 +260,7 @@ impl Runtime {
         let msg_range = format!("0-{}", messages.len().saturating_sub(1));
 
         let summary_id = match self.storage.save_summary(
-            &self.conversation_id,
+            &self.session_id,
             &summary_content,
             &msg_range,
         ) {
@@ -256,7 +277,7 @@ impl Runtime {
             let token_count = estimate_tokens(chunk);
             match self.storage.save_document(
                 &summary_id,
-                &self.conversation_id,
+                &self.session_id,
                 chunk,
                 i as i32,
                 token_count,
@@ -267,20 +288,20 @@ impl Runtime {
         }
 
         log::info!(
-            "stored summary + {} chunks for conversation {}",
+            "stored summary + {} chunks for session {}",
             chunks.len(),
-            &self.conversation_id
+            &self.session_id
         );
 
         // Generate embeddings in background if adapter is available
         if let Some(ref adapter) = self.embedding_adapter {
             let storage = self.storage.clone();
             let adapter = adapter.clone();
-            let conv_id = self.conversation_id.clone();
+            let sess_id = self.session_id.clone();
             tokio::spawn(async move {
                 let mut count = 0;
                 for doc_id in &doc_ids {
-                    let docs = match storage.get_documents_by_conversation(&conv_id) {
+                    let docs = match storage.get_documents_by_session(&sess_id) {
                         Ok(d) => d,
                         Err(e) => {
                             log::warn!("failed to get documents for embedding: {e}");
@@ -305,7 +326,7 @@ impl Runtime {
                     }
                 }
                 if count > 0 {
-                    log::info!("generated {count} embeddings for conversation {conv_id}");
+                    log::info!("generated {count} embeddings for session {sess_id}");
                 }
             });
         }

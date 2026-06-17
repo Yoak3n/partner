@@ -140,18 +140,18 @@ pub fn register_memory_manage(
                     let entry = db.get_memory(id)
                         .map_err(|e| format!("failed to get memory: {e}"))?
                         .ok_or_else(|| format!("memory '{id}' not found"))?;
-                    let conv_id = entry.conversation_id
+                    let session_id = entry.session_id
                         .as_deref()
-                        .ok_or_else(|| format!("memory '{id}' has no associated conversation"))?;
-                    let messages = db.load_messages(conv_id)
-                        .map_err(|e| format!("failed to load conversation: {e}"))?;
+                        .ok_or_else(|| format!("memory '{id}' has no associated session"))?;
+                    let messages = db.load_messages(session_id)
+                        .map_err(|e| format!("failed to load session: {e}"))?;
                     if messages.is_empty() {
-                        return Ok(format!("conversation {conv_id} has no messages"));
+                        return Ok(format!("session {session_id} has no messages"));
                     }
                     let lines: Vec<String> = messages.iter().map(|m| {
                         format!("[{}] {:?}: {}", &m.id.to_string()[..8], m.role, m.content)
                     }).collect();
-                    Ok(format!("conversation: {}\n---\n{}", conv_id, lines.join("\n")))
+                    Ok(format!("session: {}\n---\n{}", session_id, lines.join("\n")))
                 }
                 "list" => {
                     let limit = args["limit"].as_i64().unwrap_or(20);
@@ -164,11 +164,11 @@ pub fn register_memory_manage(
                     }
                     let lines: Vec<String> = entries.iter().map(|e| {
                         let tags = e.tags.as_deref().unwrap_or("");
-                        let conv = e.conversation_id.as_deref().unwrap_or("-");
-                        format!("[{}] {} (w:{:.2}, act:{}, tags:{}, conv:{})",
+                        let session = e.session_id.as_deref().unwrap_or("-");
+                        format!("[{}] {} (w:{:.2}, act:{}, tags:{}, session:{})",
                             &e.id[..8], e.title, e.weight, e.activation_count,
                             if tags.is_empty() { "none" } else { tags },
-                            &conv[..conv.len().min(8)])
+                            &session[..session.len().min(8)])
                     }).collect();
                     Ok(format!("page {page} (showing {})\n{}", entries.len(), lines.join("\n")))
                 }
@@ -218,9 +218,9 @@ pub fn register_memory_manage(
 
                     let lines: Vec<String> = results.iter().map(|r| {
                         format!(
-                            "[doc:{}] conv:{} score:{:.4}\n{}",
+                            "[doc:{}] session:{} score:{:.4}\n{}",
                             &r.document_id[..8.min(r.document_id.len())],
-                            &r.conversation_id[..8.min(r.conversation_id.len())],
+                            &r.session_id[..8.min(r.session_id.len())],
                             r.score,
                             r.content
                         )
@@ -235,13 +235,13 @@ pub fn register_memory_manage(
 
 fn format_memory(e: &MemoryEntry) -> String {
     let tags = e.tags.as_deref().unwrap_or("");
-    let conv = e.conversation_id.as_deref().unwrap_or("(none)");
+    let session = e.session_id.as_deref().unwrap_or("(none)");
     format!(
-        "[{}] {}\ntags: {}\nweight: {:.2} | activations: {} | last: {}\nconversation: {}\ncreated: {}\n\n{}",
+        "[{}] {}\ntags: {}\nweight: {:.2} | activations: {} | last: {}\nsession: {}\ncreated: {}\n\n{}",
         e.id, e.title,
         if tags.is_empty() { "none" } else { tags },
         e.weight, e.activation_count, e.last_activated_at,
-        conv,
+        session,
         e.created_at, e.content
     )
 }

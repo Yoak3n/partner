@@ -161,10 +161,10 @@ pub fn create_embedding_adapter(provider: &ModelProvider) -> Arc<dyn EmbeddingAd
 pub async fn embed_missing_documents(
     storage: &Arc<Storage>,
     adapter: &dyn EmbeddingAdapter,
-    conversation_id: &str,
+    session_id: &str,
 ) -> Result<usize, EmbeddingError> {
     let docs = storage
-        .get_documents_by_conversation(conversation_id)
+        .get_documents_by_session(session_id)
         .map_err(|e| EmbeddingError::Provider(e.to_string()))?;
 
     let mut count = 0;

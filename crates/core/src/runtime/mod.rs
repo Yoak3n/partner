@@ -31,6 +31,7 @@ pub struct Runtime {
     pub(crate) app_config: AppConfig,
     pub(crate) system_prompt: Option<String>,
     pub(crate) conversation: Conversation,
+    pub(crate) session_id: String,
     pub(crate) conversation_id: String,
     pub(crate) conversation_manager: ConversationManager,
     pub(crate) tool_registry: ToolRegistry,
@@ -63,8 +64,23 @@ impl Runtime {
         rate_limiter.configure_all(&chat_group.providers);
 
         let storage = Arc::new(storage);
-        let conversation_id = uuid::Uuid::new_v4().to_string();
-        let _ = storage.create_conversation(&conversation_id, None);
+
+        // 尝试恢复最近的 session，而不是每次都创建新的
+        let (session_id, conversation_id) = match storage.list_sessions() {
+            Ok(sessions) if !sessions.is_empty() => {
+                // 使用最近更新的 session
+                let recent = &sessions[0];
+                let conv_id = uuid::Uuid::new_v4().to_string();
+                let _ = storage.create_conversation(&conv_id, &recent.id);
+                (recent.id.clone(), conv_id)
+            }
+            _ => {
+                // 没有 session，暂不创建，等用户发送消息时再创建
+                let sid = uuid::Uuid::new_v4().to_string();
+                let cid = uuid::Uuid::new_v4().to_string();
+                (sid, cid)
+            }
+        };
 
         let system_prompt = load_system_prompt();
 
@@ -81,6 +97,7 @@ impl Runtime {
             app_config,
             system_prompt,
             conversation: Conversation::new(),
+            session_id,
             conversation_id,
             conversation_manager: ConversationManager::new(storage.clone()),
             tool_registry: ToolRegistry::new(),
@@ -196,7 +213,7 @@ impl Runtime {
     pub fn clear_conversation(&mut self) {
         self.conversation.clear();
         self.conversation_id = uuid::Uuid::new_v4().to_string();
-        let _ = self.storage.create_conversation(&self.conversation_id, None);
+        let _ = self.storage.create_conversation(&self.conversation_id, &self.session_id);
     }
 
     pub fn app_config(&self) -> &AppConfig {
@@ -237,7 +254,7 @@ impl Runtime {
         input: &str,
     ) -> Result<SubAgentResult, SubAgentError> {
         let ctx = SubAgentContext {
-            conversation_id: &self.conversation_id,
+            session_id: &self.session_id,
             message_history: &self.conversation.messages,
             available_skills: &self.available_skills,
             app_config: &self.app_config,
@@ -254,5 +271,172 @@ impl Runtime {
     pub async fn shutdown(&mut self) {
         self.process_manager.kill_all().await;
         self.mcp_manager.disconnect_all().await;
+    }
+
+    // ── Session management ──
+
+    /// Ensure the current conversation exists in the database
+    pub fn ensure_session_exists(&mut self, first_message: Option<&str>) {
+        // 如果 session 已存在，只更新 first_message（如果为空）
+        if let Some(msg) = first_message {
+            let _ = self.storage.update_session_first_message(&self.session_id, msg);
+        }
+        // 如果 session 不存在，创建它
+        let _ = self.storage.create_session(&self.session_id, None, first_message);
+        let _ = self.storage.create_conversation(&self.conversation_id, &self.session_id);
+    }
+
+    /// Ensure a new conversation exists for the current session
+    pub fn ensure_new_conversation(&mut self) {
+        self.conversation_id = uuid::Uuid::new_v4().to_string();
+        let _ = self.storage.create_conversation(&self.conversation_id, &self.session_id);
+    }
+
+    /// List all sessions
+    pub fn list_sessions(&self) {
+        match self.storage.list_sessions() {
+            Ok(list) => {
+                let _ = self.event_tx.send(AgentEvent::SessionsLoaded(list));
+            }
+            Err(e) => {
+                log::warn!("failed to list sessions: {e}");
+                let _ = self.event_tx.send(AgentEvent::Error(format!("加载会话列表失败: {e}")));
+            }
+        }
+    }
+
+    /// Create a new session (doesn't save to DB until first message)
+    pub fn new_session(&mut self) {
+        // 创建新的 session_id
+        self.session_id = uuid::Uuid::new_v4().to_string();
+        self.conversation_id = uuid::Uuid::new_v4().to_string();
+        self.conversation.clear();
+        
+        // 在数据库中创建 session 记录
+        let _ = self.storage.create_session(&self.session_id, None, None);
+        let _ = self.storage.create_conversation(&self.conversation_id, &self.session_id);
+        
+        // 通知 UI
+        let _ = self.event_tx.send(AgentEvent::SessionCreated(self.session_id.clone()));
+        
+        // 刷新 session 列表
+        self.list_sessions();
+    }
+
+    /// Switch to a specific session
+    pub fn switch_session(&mut self, session_id: &str) {
+        self.conversation.clear();
+        self.conversation_id = session_id.to_string();
+
+        // 使用分页加载，只加载最近的 50 条消息
+        const INITIAL_LOAD_LIMIT: usize = 50;
+        
+        match self.storage.load_session_file_paginated(session_id, INITIAL_LOAD_LIMIT) {
+            Ok(messages) if !messages.is_empty() => {
+                for msg in &messages {
+                    self.conversation.push(msg.clone());
+                }
+                let _ = self.event_tx.send(AgentEvent::SessionSwitched(session_id.to_string()));
+                let _ = self.event_tx.send(AgentEvent::MessagesLoaded {
+                    session_id: session_id.to_string(),
+                    messages,
+                });
+            }
+            _ => {
+                // Fall back to database
+                match self.conversation_manager.load_recent(session_id) {
+                    Ok(messages) => {
+                        let _ = self.storage.save_session_file(session_id, &messages);
+                        for msg in &messages {
+                            self.conversation.push(msg.clone());
+                        }
+                        let _ = self.event_tx.send(AgentEvent::SessionSwitched(session_id.to_string()));
+                        let _ = self.event_tx.send(AgentEvent::MessagesLoaded {
+                            session_id: session_id.to_string(),
+                            messages,
+                        });
+                    }
+                    Err(e) => {
+                        log::warn!("failed to load session {session_id}: {e}");
+                        let _ = self.event_tx.send(AgentEvent::Error(format!("加载会话失败: {e}")));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Load more messages for infinite scroll
+    pub fn load_more_messages(&self, session_id: &str, before_index: usize) {
+        const LOAD_MORE_LIMIT: usize = 30;
+        
+        match self.storage.load_messages_before(session_id, before_index, LOAD_MORE_LIMIT) {
+            Ok(messages) if !messages.is_empty() => {
+                let _ = self.event_tx.send(AgentEvent::MoreMessagesLoaded {
+                    session_id: session_id.to_string(),
+                    messages,
+                    has_more: before_index > LOAD_MORE_LIMIT,
+                });
+            }
+            Ok(_) => {
+                // No more messages
+                let _ = self.event_tx.send(AgentEvent::MoreMessagesLoaded {
+                    session_id: session_id.to_string(),
+                    messages: Vec::new(),
+                    has_more: false,
+                });
+            }
+            Err(e) => {
+                log::warn!("failed to load more messages: {e}");
+            }
+        }
+    }
+
+    /// Delete a session and refresh the list
+    pub fn delete_session(&mut self, session_id: &str) {
+        match self.storage.delete_session(session_id) {
+            Ok(()) => {
+                log::info!("deleted session {session_id}");
+                // If we deleted the current session, clear the conversation
+                if self.session_id == session_id {
+                    self.conversation.clear();
+                    self.session_id = uuid::Uuid::new_v4().to_string();
+                    self.conversation_id = uuid::Uuid::new_v4().to_string();
+                }
+                // Refresh the session list
+                self.list_sessions();
+            }
+            Err(e) => {
+                log::warn!("failed to delete session {session_id}: {e}");
+                let _ = self.event_tx.send(AgentEvent::Error(format!("删除会话失败: {e}")));
+            }
+        }
+    }
+
+    /// Toggle pin status of a session
+    pub fn toggle_pin_session(&mut self, session_id: &str) {
+        match self.storage.toggle_session_pinned(session_id) {
+            Ok(pinned) => {
+                log::info!("session {session_id} pinned={pinned}");
+                self.list_sessions();
+            }
+            Err(e) => {
+                log::warn!("failed to toggle pin {session_id}: {e}");
+                let _ = self.event_tx.send(AgentEvent::Error(format!("置顶失败: {e}")));
+            }
+        }
+    }
+
+    /// Toggle archive status of a session
+    pub fn toggle_archive_session(&mut self, session_id: &str) {
+        match self.storage.toggle_session_archived(session_id) {
+            Ok(archived) => {
+                log::info!("session {session_id} archived={archived}");
+                self.list_sessions();
+            }
+            Err(e) => {
+                log::warn!("failed to toggle archive {session_id}: {e}");
+                let _ = self.event_tx.send(AgentEvent::Error(format!("归档失败: {e}")));
+            }
+        }
     }
 }

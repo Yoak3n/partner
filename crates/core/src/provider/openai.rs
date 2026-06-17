@@ -191,7 +191,7 @@ impl LlmAdapter for OpenAIAdapter {
         let request = ChatRequest {
             model: provider.model.clone(),
             messages: chat_messages,
-            max_tokens: Some(provider.max_tokens),
+            max_tokens: Some(provider.max_output),
             tools: chat_tools,
             stream: true,
         };

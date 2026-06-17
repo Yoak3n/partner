@@ -68,7 +68,7 @@ impl Runtime {
         let ctx = HookContext {
             provider: &dummy_provider,
             round: 0,
-            conversation_id: &self.conversation_id,
+            session_id: &self.session_id,
         };
         for hook in &self.hooks {
             hook.on_error(&ctx, error).await;

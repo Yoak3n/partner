@@ -25,8 +25,8 @@ impl ConversationManager {
     }
 
     /// Load recent messages from the database, compressing tool-related content.
-    pub fn load_recent(&self, conversation_id: &str) -> Result<Vec<Message>, String> {
-        let messages = self.storage.load_messages(conversation_id)
+    pub fn load_recent(&self, session_id: &str) -> Result<Vec<Message>, String> {
+        let messages = self.storage.load_messages(session_id)
             .map_err(|e| format!("failed to load messages: {e}"))?;
 
         Ok(messages.iter().map(|m| self.compress_message(m)).collect())

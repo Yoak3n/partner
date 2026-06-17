@@ -19,7 +19,7 @@ pub trait SubAgent: Send + Sync {
 
 /// Context passed to a sub-agent during execution.
 pub struct SubAgentContext<'a> {
-    pub conversation_id: &'a str,
+    pub session_id: &'a str,
     pub message_history: &'a [Message],
     pub available_skills: &'a [Skill],
     pub app_config: &'a AppConfig,

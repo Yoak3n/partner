@@ -32,11 +32,34 @@ pub async fn recv_event() -> TrayEvent {
     }
 }
 
+/// Get the current executable path for re-launching
+fn get_exe_path() -> Option<std::path::PathBuf> {
+    std::env::current_exe().ok()
+}
+
+/// Re-launch the application
+fn relaunch_app() {
+    if let Some(exe) = get_exe_path() {
+        eprintln!("[tray] Relaunching app from: {:?}", exe);
+        match std::process::Command::new(&exe).spawn() {
+            Ok(_) => eprintln!("[tray] App relaunched successfully"),
+            Err(e) => eprintln!("[tray] Failed to relaunch app: {}", e),
+        }
+    } else {
+        eprintln!("[tray] Could not determine executable path");
+    }
+}
+
 fn setup_tray(tx: mpsc::UnboundedSender<TrayEvent>) {
-    let icon = tray_icon::Icon::from_path(
-        concat!(env!("CARGO_MANIFEST_DIR"), "/icons/icon.ico"),
-        None,
-    ).expect("failed to load tray icon from ico");
+    // Initialize GTK for Linux/Wayland tray support
+    #[cfg(not(windows))]
+    {
+        if !gtk::is_initialized() {
+            gtk::init().expect("Failed to initialize GTK");
+        }
+    }
+    
+    let icon = load_icon();
 
     let menu = muda::Menu::new();
     let show_item = muda::MenuItem::with_id("show", "Show", true, None);
@@ -57,20 +80,33 @@ fn setup_tray(tx: mpsc::UnboundedSender<TrayEvent>) {
     // Handle tray icon events (double-click to show)
     tray_icon::TrayIconEvent::set_event_handler(Some(move |event| {
         if let tray_icon::TrayIconEvent::DoubleClick { .. } = event {
-            let _ = send_event(TrayEvent::Show);
+            // Try to send event to running app, if that fails, relaunch
+            if send_event(TrayEvent::Show).is_err() {
+                relaunch_app();
+            }
         }
     }));
 
     // Handle menu events
     muda::MenuEvent::set_event_handler(Some(move |event: muda::MenuEvent| {
         match event.id().0.as_str() {
-            "show" => { let _ = tx.send(TrayEvent::Show); }
-            "quit" => { let _ = tx.send(TrayEvent::Quit); }
+            "show" => {
+                // Try to send event to running app, if that fails, relaunch
+                if tx.send(TrayEvent::Show).is_err() {
+                    relaunch_app();
+                }
+            }
+            "quit" => {
+                let _ = tx.send(TrayEvent::Quit);
+                // Give some time for cleanup, then exit
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::process::exit(0);
+            }
             _ => {}
         }
     }));
 
-    // Keep tray alive and pump Windows messages for the hidden tray window
+    // Keep tray alive and pump messages
     let _keep = tray;
     #[cfg(windows)]
     {
@@ -85,9 +121,29 @@ fn setup_tray(tx: mpsc::UnboundedSender<TrayEvent>) {
     }
     #[cfg(not(windows))]
     {
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(3600));
-        }
+        // Run GTK main loop for tray icon to work on Linux/Wayland
+        gtk::main();
+    }
+}
+
+fn load_icon() -> tray_icon::Icon {
+    #[cfg(windows)]
+    {
+        tray_icon::Icon::from_path(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/icons/icon.ico"),
+            None,
+        ).expect("failed to load tray icon from ico")
+    }
+    #[cfg(not(windows))]
+    {
+        let icon_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/icons/icon.png");
+        let image = image::open(icon_path)
+            .expect("failed to open tray icon")
+            .into_rgba8();
+        let (width, height) = image.dimensions();
+        let rgba = image.into_raw();
+        tray_icon::Icon::from_rgba(rgba, width, height)
+            .expect("failed to create tray icon from RGBA")
     }
 }
 
