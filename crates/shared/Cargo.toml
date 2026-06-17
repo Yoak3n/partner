@@ -1,0 +1,15 @@
+[package]
+name = "ai-partner-shared"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+rusqlite = { version = "0.35", features = ["bundled"] }
+dirs = "6"
+thiserror = "2"
+serde_yml = "0.0.12"
+log = "0.4"
