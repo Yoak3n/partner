@@ -1,6 +1,4 @@
-use std::sync::Arc;
-
-use ai_partner_shared::{Message, Role, Storage};
+use ai_partner_shared::{Message, Role};
 use serde_json::Value;
 
 /// Truncate string values inside a JSON object to `max_chars` per value.
@@ -25,40 +23,28 @@ fn truncate_json_values(value: &Value, max_chars: usize) -> Value {
                 .collect();
             Value::Object(truncated)
         }
-        // numbers, bools, null — pass through
         other => other.clone(),
     }
 }
 
-/// Manages conversation lifecycle: history loading, tool message compression,
-/// and message eviction when the conversation grows too long.
+/// Manages in-memory conversation state: compaction threshold checks,
+/// message eviction, and tool content compression.
 pub struct ConversationManager {
-    storage: Arc<Storage>,
     /// Message count threshold that triggers compaction.
     pub max_messages: usize,
     /// Number of recent messages to keep when compacting.
     pub min_recent_messages: usize,
-    /// Max characters to keep from tool results when loading history.
+    /// Max characters to keep from tool results/arguments when compressing.
     pub tool_result_truncate: usize,
 }
 
 impl ConversationManager {
-    pub fn new(storage: Arc<Storage>) -> Self {
+    pub fn new() -> Self {
         Self {
-            storage,
             max_messages: 100,
             min_recent_messages: 20,
             tool_result_truncate: 200,
         }
-    }
-
-    /// Load recent messages from the database, compressing tool-related content.
-    /// Only loads up to `max_messages` to avoid immediately triggering compaction.
-    pub fn load_recent(&self, session_id: &str) -> Result<Vec<Message>, String> {
-        let messages = self.storage.load_messages_recent(session_id, self.max_messages)
-            .map_err(|e| format!("failed to load messages: {e}"))?;
-
-        Ok(messages.iter().map(|m| self.compress_message(m)).collect())
     }
 
     /// Check whether the message list exceeds the compaction threshold.
@@ -123,16 +109,10 @@ impl ConversationManager {
         lines.join("\n")
     }
 
-    /// Borrow the underlying storage.
-    pub fn storage_ref(&self) -> &Arc<Storage> {
-        &self.storage
-    }
-
-    /// Compress a single message to reduce context usage (for history loading).
-    fn compress_message(&self, msg: &Message) -> Message {
+    /// Compress a message to reduce context usage (truncates tool payloads).
+    pub fn compress_message(&self, msg: &Message) -> Message {
         match msg.role {
             Role::Tool => {
-                // Truncate verbose tool results
                 let truncated: String = msg.content.chars().take(self.tool_result_truncate).collect();
                 let content = if truncated.len() < msg.content.len() {
                     format!("{}...", truncated)
@@ -145,7 +125,6 @@ impl ConversationManager {
                 }
             }
             Role::Assistant if msg.tool_calls.is_some() => {
-                // Keep tool_calls structure, clear content, truncate arguments
                 let tool_calls = msg.tool_calls.as_ref().map(|calls| {
                     calls
                         .iter()

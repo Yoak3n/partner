@@ -101,6 +101,7 @@ impl Storage {
                 title             TEXT NOT NULL,
                 content           TEXT NOT NULL,
                 tags              TEXT,
+                session_id        TEXT,
                 conversation_id   TEXT,
                 weight            REAL NOT NULL DEFAULT 1.0,
                 last_activated_at TEXT NOT NULL,
@@ -315,6 +316,45 @@ impl Storage {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Load messages for a specific conversation (ordered by sort_order).
+    pub fn load_messages_by_conversation(&self, conversation_id: &str) -> Result<Vec<Message>, StorageError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, role, content, timestamp, tool_calls, tool_call_id FROM messages
+             WHERE conversation_id = ?1 ORDER BY sort_order",
+        )?;
+        let rows = stmt.query_map(params![conversation_id], |row| {
+            let id_str: String = row.get(0)?;
+            let role_str: String = row.get(1)?;
+            let content: String = row.get(2)?;
+            let ts_str: String = row.get(3)?;
+            let tool_calls_json: Option<String> = row.get(4)?;
+            let tool_call_id: Option<String> = row.get(5)?;
+
+            let role = match role_str.as_str() {
+                "user" => Role::User,
+                "assistant" => Role::Assistant,
+                "system" => Role::System,
+                _ => Role::Tool,
+            };
+            let timestamp = chrono::DateTime::parse_from_rfc3339(&ts_str)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now());
+            let tool_calls = tool_calls_json
+                .and_then(|json| serde_json::from_str(&json).ok());
+
+            Ok(Message {
+                id: uuid::Uuid::parse_str(&id_str).unwrap_or_else(|_| uuid::Uuid::new_v4()),
+                role,
+                content,
+                timestamp,
+                tool_calls,
+                tool_call_id,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// Load the most recent N messages for a session (ordered by sort_order).
     pub fn load_messages_recent(
         &self,
@@ -488,7 +528,7 @@ impl Storage {
     // ── Memories (weighted with forgetting curve) ──
 
     const SELECT_MEMORY_COLS: &'static str =
-        "id, title, content, tags, session_id, weight, last_activated_at, activation_count, created_at, updated_at";
+        "id, title, content, tags, session_id, conversation_id, weight, last_activated_at, activation_count, created_at, updated_at";
 
     fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<MemoryEntry> {
         Ok(MemoryEntry {
@@ -497,11 +537,12 @@ impl Storage {
             content: row.get(2)?,
             tags: row.get(3)?,
             session_id: row.get(4)?,
-            weight: row.get(5)?,
-            last_activated_at: row.get(6)?,
-            activation_count: row.get(7)?,
-            created_at: row.get(8)?,
-            updated_at: row.get(9)?,
+            conversation_id: row.get(5)?,
+            weight: row.get(6)?,
+            last_activated_at: row.get(7)?,
+            activation_count: row.get(8)?,
+            created_at: row.get(9)?,
+            updated_at: row.get(10)?,
         })
     }
 
@@ -512,24 +553,25 @@ impl Storage {
         content: &str,
         tags: Option<&str>,
         session_id: Option<&str>,
+        conversation_id: Option<&str>,
     ) -> Result<String, StorageError> {
         let now = chrono::Utc::now().to_rfc3339();
         let id = match id {
             Some(existing_id) => {
                 self.conn.lock().unwrap().execute(
-                    "INSERT INTO memories (id, title, content, tags, conversation_id, weight, last_activated_at, activation_count, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 1.0, ?6, 0, ?6, ?6)
-                     ON CONFLICT(id) DO UPDATE SET title=excluded.title, content=excluded.content, tags=excluded.tags, conversation_id=excluded.conversation_id, updated_at=excluded.updated_at",
-                    params![existing_id, title, content, tags, session_id, now],
+                    "INSERT INTO memories (id, title, content, tags, session_id, conversation_id, weight, last_activated_at, activation_count, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1.0, ?7, 0, ?7, ?7)
+                     ON CONFLICT(id) DO UPDATE SET title=excluded.title, content=excluded.content, tags=excluded.tags, session_id=excluded.session_id, conversation_id=excluded.conversation_id, updated_at=excluded.updated_at",
+                    params![existing_id, title, content, tags, session_id, conversation_id, now],
                 )?;
                 existing_id.to_string()
             }
             None => {
                 let new_id = uuid::Uuid::new_v4().to_string();
                 self.conn.lock().unwrap().execute(
-                    "INSERT INTO memories (id, title, content, tags, conversation_id, weight, last_activated_at, activation_count, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 1.0, ?6, 0, ?6, ?6)",
-                    params![new_id, title, content, tags, session_id, now],
+                    "INSERT INTO memories (id, title, content, tags, session_id, conversation_id, weight, last_activated_at, activation_count, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1.0, ?7, 0, ?7, ?7)",
+                    params![new_id, title, content, tags, session_id, conversation_id, now],
                 )?;
                 new_id
             }
@@ -786,6 +828,7 @@ pub struct MemoryEntry {
     pub content: String,
     pub tags: Option<String>,
     pub session_id: Option<String>,
+    pub conversation_id: Option<String>,
     pub weight: f64,
     pub last_activated_at: String,
     pub activation_count: i64,

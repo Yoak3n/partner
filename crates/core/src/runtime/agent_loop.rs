@@ -15,11 +15,11 @@ impl Runtime {
     pub async fn send_message(&mut self, content: impl Into<String>) {
         // Load conversation history from DB if this is a fresh in-memory state
         if self.conversation.messages.is_empty() {
-            match self.conversation_manager.load_recent(&self.session_id) {
+            match self.storage.load_messages_recent(&self.session_id, self.conversation_manager.max_messages) {
                 Ok(history) if !history.is_empty() => {
                     log::info!("loaded {} messages from session history", history.len());
                     for msg in history {
-                        self.conversation.push(msg);
+                        self.conversation.push(self.conversation_manager.compress_message(&msg));
                     }
                 }
                 Ok(_) => {}
@@ -182,6 +182,7 @@ impl Runtime {
                     self.conversation.push(assistant_msg.clone());
                     let order = self.conversation.messages.len() as i64 - 1;
                     let _ = self.storage.save_message(&self.session_id, &self.conversation_id, &assistant_msg, order);
+                    let _ = self.event_tx.send(AgentEvent::MessageComplete(assistant_msg));
 
                     let result = self.execute_tool_calls(&ctx, &calls, round, max_rounds).await;
                     match result {

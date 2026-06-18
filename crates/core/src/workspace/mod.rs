@@ -84,7 +84,10 @@ impl Workspace {
 
         if let Some(global) = global_prompt {
             if !global.trim().is_empty() {
-                parts.push(global.to_string());
+                let formatted = global
+                    .replace("{workspace_root}", &self.root.display().to_string())
+                    .replace("{memory_path}", &self.memory_path().display().to_string());
+                parts.push(formatted);
             }
         }
 

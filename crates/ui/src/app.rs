@@ -3,6 +3,7 @@ use iced::{clipboard, Color, Element, Length, Subscription, Task, Theme};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+use std::collections::HashSet;
 use ai_partner_shared::{AgentEvent, Message, SessionSummary};
 
 use crate::components::{message_view, title_bar};
@@ -12,6 +13,7 @@ use crate::tray::TrayEvent;
 pub struct App {
     input: String,
     messages: Vec<Message>,
+    display_items: Vec<message_view::DisplayItem>,
     is_thinking: bool,
     streaming_content: String,
     copy_toast: Option<String>,
@@ -20,6 +22,7 @@ pub struct App {
     sessions: Vec<SessionSummary>,
     show_sidebar: bool,
     cmd_tx: mpsc::UnboundedSender<RuntimeCommand>,
+    expanded_tool_calls: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +37,7 @@ pub enum AppEvent {
     WindowDrag,
     CopyText(String),
     ClearCopyToast,
+    ToggleToolCall(String),
     ToggleSidebar,
     NewSession,
     SwitchSession(String),
@@ -72,6 +76,7 @@ impl App {
             Self {
                 input: String::new(),
                 messages: Vec::new(),
+                display_items: Vec::new(),
                 is_thinking: false,
                 streaming_content: String::new(),
                 copy_toast: None,
@@ -80,9 +85,14 @@ impl App {
                 sessions: Vec::new(),
                 show_sidebar: true,
                 cmd_tx,
+                expanded_tool_calls: HashSet::new(),
             },
             setup,
         )
+    }
+
+    fn refresh_display_items(&mut self) {
+        self.display_items = message_view::merge_messages(&self.messages);
     }
 
     fn handle_input(&mut self, event: AppEvent) -> Task<AppEvent> {
@@ -97,6 +107,7 @@ impl App {
                 }
                 let _ = self.cmd_tx.send(RuntimeCommand::SendMessage(self.input.clone()));
                 self.messages.push(Message::user(&self.input));
+                self.refresh_display_items();
                 self.input.clear();
                 self.is_thinking = true;
                 let _ = self.cmd_tx.send(RuntimeCommand::ListSessions);
@@ -116,17 +127,23 @@ impl App {
                 self.streaming_content.push_str(&chunk);
             }
             AgentEvent::MessageComplete(msg) => {
+                let has_tool_calls = msg.tool_calls.is_some();
                 self.messages.push(msg);
-                self.is_thinking = false;
-                self.streaming_content.clear();
+                self.refresh_display_items();
+                if !has_tool_calls {
+                    self.is_thinking = false;
+                    self.streaming_content.clear();
+                }
             }
             AgentEvent::Error(err) => {
                 self.messages.push(Message::system(format!("[Error] {err}")));
+                self.refresh_display_items();
                 self.is_thinking = false;
                 self.streaming_content.clear();
             }
-            AgentEvent::ToolCallResult { result, .. } => {
-                self.messages.push(Message::system(format!("[Tool] {result}")));
+            AgentEvent::ToolCallResult { call_id, result } => {
+                self.messages.push(Message::tool_result(&call_id, &result));
+                self.refresh_display_items();
             }
             AgentEvent::Done => {
                 self.is_thinking = false;
@@ -137,6 +154,7 @@ impl App {
             AgentEvent::SessionCreated(id) => {
                 self.session_id = Some(id);
                 self.messages.clear();
+                self.refresh_display_items();
             }
             AgentEvent::SessionSwitched(id) => {
                 self.session_id = Some(id);
@@ -145,6 +163,7 @@ impl App {
             }
             AgentEvent::MessagesLoaded { messages, .. } => {
                 self.messages = messages;
+                self.refresh_display_items();
                 self.loading_session_id = None;
                 // 消息加载完成后再关闭侧边栏
                 self.show_sidebar = false;
@@ -249,6 +268,12 @@ impl App {
             }
             AppEvent::TrayEvent(e) => Self::handle_tray(e.clone()),
             AppEvent::CopyText(_) | AppEvent::ClearCopyToast => self.handle_clipboard(event),
+            AppEvent::ToggleToolCall(id) => {
+                if !self.expanded_tool_calls.remove(id) {
+                    self.expanded_tool_calls.insert(id.clone());
+                }
+                Task::none()
+            }
             AppEvent::ToggleSidebar | AppEvent::NewSession | AppEvent::SwitchSession(_) | AppEvent::DeleteSession(_) | AppEvent::PinSession(_) | AppEvent::ArchiveSession(_) => {
                 self.handle_sidebar(event)
             }
@@ -349,12 +374,20 @@ impl App {
             .padding(8.0)
         };
 
-        // Chat area
-        let messages = self
-            .messages
+        // Chat area — merge tool calls with their results
+        let expanded_set = &self.expanded_tool_calls;
+        let messages = self.display_items
             .iter()
-            .fold(column![].spacing(8), |col, msg| {
-                col.push(message_view::view(msg))
+            .fold(column![].spacing(8), |col, item| {
+                match item {
+                    message_view::DisplayItem::Message(msg) => {
+                        col.push(message_view::view_message(msg))
+                    }
+                    message_view::DisplayItem::ToolCall { call, result } => {
+                        let is_expanded = expanded_set.contains(&call.id);
+                        col.push(message_view::view_tool_call(call, result, is_expanded))
+                    }
+                }
             });
 
         let messages = if !self.streaming_content.is_empty() {

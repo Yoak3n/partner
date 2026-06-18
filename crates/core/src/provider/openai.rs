@@ -46,6 +46,7 @@ struct ChatRequest {
 #[derive(Serialize)]
 struct ChatMessage {
     role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ChatToolCall>>,
@@ -126,11 +127,7 @@ fn build_messages(messages: &[Message]) -> Vec<ChatMessage> {
             };
             ChatMessage {
                 role: role.to_string(),
-                content: if m.content.is_empty() {
-                    None
-                } else {
-                    Some(m.content.clone())
-                },
+                content: Some(m.content.clone()),
                 tool_calls: m.tool_calls.as_ref().map(|tcs| {
                     tcs.iter()
                         .map(|tc| ChatToolCall {

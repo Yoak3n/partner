@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 
 use ai_partner_shared::{
-    AgentEvent, AppConfig, ModelKind, Skill, Storage, ToolDefinition,
+    AgentEvent, AppConfig, Message, ModelKind, Skill, Storage, ToolDefinition,
     WorkspaceConfig, load_system_prompt,
 };
 
@@ -50,6 +50,8 @@ pub struct Runtime {
     pub(crate) storage: Arc<Storage>,
     pub(crate) subagent_registry: SubAgentRegistry,
     pub(crate) diary_path: Arc<Mutex<std::path::PathBuf>>,
+    /// Shared workspace root for tools to resolve relative paths.
+    pub(crate) workspace_root: Arc<Mutex<Option<std::path::PathBuf>>>,
 }
 
 impl Runtime {
@@ -100,6 +102,7 @@ impl Runtime {
             .join("memory")
             .join("diary");
         let diary_path = Arc::new(Mutex::new(default_diary));
+        let workspace_root: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::new(Mutex::new(None));
 
         let mut runtime = Self {
             agent,
@@ -108,7 +111,7 @@ impl Runtime {
             conversation: Conversation::new(),
             session_id,
             conversation_id,
-            conversation_manager: ConversationManager::new(storage.clone()),
+            conversation_manager: ConversationManager::new(),
             tool_registry: ToolRegistry::new(),
             mcp_manager: McpManager::new(),
             process_manager,
@@ -125,9 +128,10 @@ impl Runtime {
             storage,
             subagent_registry: SubAgentRegistry::new(),
             diary_path: diary_path.clone(),
+            workspace_root: workspace_root.clone(),
         };
 
-        register_builtins(&mut runtime.tool_registry, event_tx);
+        register_builtins(&mut runtime.tool_registry, event_tx, workspace_root);
         register_memory_manage(&mut runtime.tool_registry, runtime.storage.clone(), runtime.embedding_adapter.clone());
 
         // Register built-in sub-agents
@@ -140,7 +144,7 @@ impl Runtime {
         runtime.subagent_registry.register_arc(compaction_agent.clone());
 
         runtime.hooks.push(Box::new(CompactionHook::new(
-            ConversationManager::new(runtime.storage.clone()),
+            ConversationManager::new(),
             compaction_agent,
             Arc::new(runtime.app_config.clone()),
             runtime.diary_path.clone(),
@@ -189,6 +193,8 @@ impl Runtime {
                 // Update diary path to workspace memory directory
                 let new_diary = ws.memory_path().join("diary");
                 *self.diary_path.lock().await = new_diary;
+                // Update shared workspace root for tools
+                *self.workspace_root.lock().await = Some(ws.root().clone());
 
                 // If using default path, persist it to config so the agent knows the location
                 if used_default {
@@ -354,15 +360,18 @@ impl Runtime {
         self.conversation.clear();
         self.conversation_id = session_id.to_string();
 
-        match self.conversation_manager.load_recent(session_id) {
+        match self.storage.load_messages_recent(session_id, self.conversation_manager.max_messages) {
             Ok(messages) => {
-                for msg in &messages {
+                let compressed: Vec<Message> = messages.iter()
+                    .map(|m| self.conversation_manager.compress_message(m))
+                    .collect();
+                for msg in &compressed {
                     self.conversation.push(msg.clone());
                 }
                 let _ = self.event_tx.send(AgentEvent::SessionSwitched(session_id.to_string()));
                 let _ = self.event_tx.send(AgentEvent::MessagesLoaded {
                     session_id: session_id.to_string(),
-                    messages,
+                    messages: compressed,
                 });
             }
             Err(e) => {

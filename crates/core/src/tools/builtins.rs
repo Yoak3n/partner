@@ -1,43 +1,66 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ai_partner_shared::{AgentEvent, MemoryEntry, Storage, ToolDefinition};
 use serde_json::json;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
 use crate::provider::EmbeddingAdapter;
 use super::registry::ToolRegistry;
 
+/// Resolve a file path: absolute paths pass through, relative paths resolve
+/// against the workspace root (if set) or fall back to CWD.
+fn resolve_path(raw: &str, workspace_root: &Option<PathBuf>) -> PathBuf {
+    let p = Path::new(raw);
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    if let Some(root) = workspace_root {
+        root.join(raw)
+    } else {
+        p.to_path_buf()
+    }
+}
+
 /// Register all builtin tools into the registry.
 ///
 /// `event_tx` is needed by `run_command` for subprocess output streaming.
+/// `workspace_root` is shared so tools can resolve relative paths against the workspace.
 pub fn register_builtins(
     registry: &mut ToolRegistry,
     event_tx: mpsc::UnboundedSender<AgentEvent>,
+    workspace_root: Arc<Mutex<Option<PathBuf>>>,
 ) {
-    registry.register(read_file_def(), |args| {
-        let path = args["path"]
+    let ws = workspace_root.clone();
+    registry.register(read_file_def(), move |args| {
+        let raw_path = args["path"]
             .as_str()
             .ok_or("missing 'path' argument")?;
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("failed to read '{path}': {e}"))?;
+        // Blocking lock is fine here — tool handlers run on a blocking thread
+        let ws_guard = ws.blocking_lock();
+        let path = resolve_path(raw_path, &ws_guard);
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read '{}': {e}", path.display()))?;
         Ok(content)
     });
 
-    registry.register(write_file_def(), |args| {
-        let path = args["path"]
+    let ws = workspace_root.clone();
+    registry.register(write_file_def(), move |args| {
+        let raw_path = args["path"]
             .as_str()
             .ok_or("missing 'path' argument")?;
         let content = args["content"]
             .as_str()
             .ok_or("missing 'content' argument")?;
-        if let Some(parent) = Path::new(path).parent() {
+        let ws_guard = ws.blocking_lock();
+        let path = resolve_path(raw_path, &ws_guard);
+        if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("failed to create dirs: {e}"))?;
         }
-        std::fs::write(path, content)
-            .map_err(|e| format!("failed to write '{path}': {e}"))?;
-        Ok(format!("wrote {} bytes to {path}", content.len()))
+        std::fs::write(&path, content)
+            .map_err(|e| format!("failed to write '{}': {e}", path.display()))?;
+        Ok(format!("wrote {} bytes to {}", content.len(), path.display()))
     });
 
     registry.register(search_files_def(), |args| {
@@ -117,8 +140,9 @@ pub fn register_memory_manage(
                         .ok_or("missing 'content' for save")?;
                     let id = args["id"].as_str();
                     let tags = args["tags"].as_str();
+                    let session_id = args["session_id"].as_str();
                     let conversation_id = args["conversation_id"].as_str();
-                    let new_id = db.save_memory(id, title, content, tags, conversation_id)
+                    let new_id = db.save_memory(id, title, content, tags, session_id, conversation_id)
                         .map_err(|e| format!("failed to save memory: {e}"))?;
                     Ok(format!("saved memory: {new_id}"))
                 }
@@ -140,15 +164,25 @@ pub fn register_memory_manage(
                     let entry = db.get_memory(id)
                         .map_err(|e| format!("failed to get memory: {e}"))?
                         .ok_or_else(|| format!("memory '{id}' not found"))?;
-                    let sid = entry.session_id
-                        .as_deref()
-                        .ok_or_else(|| format!("memory '{id}' has no associated session"))?;
                     let limit = args["limit"].as_i64().unwrap_or(30) as usize;
                     let page = args["page"].as_i64().unwrap_or(1).max(1) as usize;
-                    let messages = db.load_messages(sid)
-                        .map_err(|e| format!("failed to load session: {e}"))?;
+                    let conv_id = args["conversation_id"].as_str();
+
+                    let (messages, source_label) = if let Some(cid) = conv_id {
+                        let msgs = db.load_messages_by_conversation(cid)
+                            .map_err(|e| format!("failed to load conversation: {e}"))?;
+                        (msgs, format!("conversation: {cid}"))
+                    } else {
+                        let sid = entry.session_id
+                            .as_deref()
+                            .ok_or_else(|| format!("memory '{id}' has no associated session"))?;
+                        let msgs = db.load_messages(sid)
+                            .map_err(|e| format!("failed to load session: {e}"))?;
+                        (msgs, format!("session: {sid}"))
+                    };
+
                     if messages.is_empty() {
-                        return Ok(format!("session {sid} has no messages"));
+                        return Ok(format!("{source_label} has no messages"));
                     }
                     let total = messages.len();
                     let start = (page - 1) * limit;
@@ -160,7 +194,7 @@ pub fn register_memory_manage(
                         let content = compact_content(&m.content);
                         format!("[{}] {:?}: {}", &m.id.to_string()[..8], m.role, content)
                     }).collect();
-                    let header = format!("session: {} (page {page}, showing {}-{}/{})", sid, start + 1, end, total);
+                    let header = format!("{source_label} (page {page}, showing {}-{}/{})", start + 1, end, total);
                     Ok(format!("{}\n---\n{}", header, lines.join("\n")))
                 }
                 "list" => {
@@ -290,12 +324,14 @@ fn compact_content(content: &str) -> String {
 fn format_memory(e: &MemoryEntry) -> String {
     let tags = e.tags.as_deref().unwrap_or("");
     let session = e.session_id.as_deref().unwrap_or("(none)");
+    let conv = e.conversation_id.as_deref().unwrap_or("(none)");
     format!(
-        "[{}] {}\ntags: {}\nweight: {:.2} | activations: {} | last: {}\nsession: {}\ncreated: {}\n\n{}",
+        "[{}] {}\ntags: {}\nweight: {:.2} | activations: {} | last: {}\nsession: {} | conversation: {}\ncreated: {}\n\n{}",
         e.id, e.title,
         if tags.is_empty() { "none" } else { tags },
         e.weight, e.activation_count, e.last_activated_at,
-        session,
+        &session[..session.len().min(8)],
+        &conv[..conv.len().min(8)],
         e.created_at, e.content
     )
 }
@@ -433,7 +469,7 @@ fn memory_manage_def() -> ToolDefinition {
                 },
                 "conversation_id": {
                     "type": "string",
-                    "description": "ID of the conversation that created this memory (optional, for save)"
+                    "description": "Conversation ID. For save: associate memory with this conversation. For load: load messages from this specific conversation instead of the whole session"
                 },
                 "query": {
                     "type": "string",

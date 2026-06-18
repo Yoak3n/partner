@@ -100,7 +100,14 @@ impl Runtime {
                             Err(e) => format!("Sub-agent error: {e}"),
                         }
                     } else {
-                        match tool_registry.call(&call.name, call.arguments.clone(), process_manager).await {
+                        let mut args = call.arguments.clone();
+                        // Auto-inject session_id for memory_manage
+                        if call.name == "memory_manage" {
+                            if args.get("session_id").is_none() {
+                                args["session_id"] = serde_json::json!(session_id);
+                            }
+                        }
+                        match tool_registry.call(&call.name, args, process_manager).await {
                             Ok(r) => r,
                             Err(e) => format!("Tool error: {e}"),
                         }

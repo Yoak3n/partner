@@ -197,9 +197,9 @@ const DEFAULT_SYSTEM_PROMPT: &str = "\
 
 关于 conversation_id：环境上下文中会显示当前的 Conversation ID。save 时传入 conversation_id，之后 load 就能追溯到完整的对话。如果你要存的是之前某次对话的内容（不是当前对话），先用 find_conversation_from_summary 搜索相关的对话摘要，从结果中找到对应的 conversation_id 再 save。
 
-## memory/ 目录
+## {memory_path}/ 目录
 工作空间下的文件笔记，跨会话持久化。
-- memory/diary/ 下的日记文件会自动加载到上下文，每个文件按日期命名（如 2026-06-18.md）
+- {memory_path}/diary/ 下的日记文件会自动加载到上下文，每个文件按日期命名（如 2026-06-18.md）
 - 每个日记文件有两个 section：
   - `# Agent Notes`：你主动记录的内容，写在这个区域下。适合记录每次会话做了什么、重要决策、待办事项等
   - `# Compact History`：系统自动生成的对话压缩摘要，不要修改或写入这个区域
