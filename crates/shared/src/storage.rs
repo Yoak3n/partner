@@ -315,119 +315,49 @@ impl Storage {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    // ── Session file management ──
-
-    /// Directory for session file storage
-    fn sessions_dir() -> Result<PathBuf, StorageError> {
-        let base = dirs::config_dir()
-            .or_else(|| dirs::home_dir())
-            .unwrap_or_else(|| PathBuf::from("."));
-        let dir = base.join("ai-partner").join("sessions");
-        std::fs::create_dir_all(&dir)?;
-        Ok(dir)
-    }
-
-    /// Get path for full session history file
-    pub fn session_file_path(session_id: &str) -> Result<PathBuf, StorageError> {
-        Ok(Self::sessions_dir()?.join(format!("{session_id}.json")))
-    }
-
-    /// Save full session history to file (for UI rendering)
-    pub fn save_session_file(
-        &self,
-        session_id: &str,
-        messages: &[Message],
-    ) -> Result<(), StorageError> {
-        let path = Self::session_file_path(session_id)?;
-        let json = serde_json::to_string_pretty(messages)
-            .map_err(|e| StorageError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-        std::fs::write(&path, json)?;
-        Ok(())
-    }
-
-    /// Load full session history from file (for UI rendering)
-    pub fn load_session_file(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<Message>, StorageError> {
-        let path = Self::session_file_path(session_id)?;
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        let json = std::fs::read_to_string(&path)?;
-        let messages: Vec<Message> = serde_json::from_str(&json)
-            .map_err(|e| StorageError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-        Ok(messages)
-    }
-
-    /// Load session file with pagination (last N messages)
-    pub fn load_session_file_paginated(
+    /// Load the most recent N messages for a session (ordered by sort_order).
+    pub fn load_messages_recent(
         &self,
         session_id: &str,
         limit: usize,
     ) -> Result<Vec<Message>, StorageError> {
-        let path = Self::session_file_path(session_id)?;
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        let json = std::fs::read_to_string(&path)?;
-        let all_messages: Vec<Message> = serde_json::from_str(&json)
-            .map_err(|e| StorageError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-        
-        // 返回最后 limit 条消息
-        let start = all_messages.len().saturating_sub(limit);
-        Ok(all_messages[start..].to_vec())
-    }
-
-    /// Load more messages from session file (for infinite scroll)
-    pub fn load_messages_before(
-        &self,
-        session_id: &str,
-        before_index: usize,
-        limit: usize,
-    ) -> Result<Vec<Message>, StorageError> {
-        let path = Self::session_file_path(session_id)?;
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        let json = std::fs::read_to_string(&path)?;
-        let all_messages: Vec<Message> = serde_json::from_str(&json)
-            .map_err(|e| StorageError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-        
-        // 返回 before_index 之前的 limit 条消息
-        let end = before_index.min(all_messages.len());
-        let start = end.saturating_sub(limit);
-        Ok(all_messages[start..end].to_vec())
-    }
-
-    /// Get total message count in session file
-    pub fn get_session_message_count(
-        &self,
-        session_id: &str,
-    ) -> Result<usize, StorageError> {
-        let path = Self::session_file_path(session_id)?;
-        if !path.exists() {
-            return Ok(0);
-        }
-        let json = std::fs::read_to_string(&path)?;
-        let messages: Vec<Message> = serde_json::from_str(&json)
-            .map_err(|e| StorageError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-        Ok(messages.len())
-    }
-
-    /// Delete messages for a session where sort_order < `before_order`.
-    /// Returns the number of deleted rows.
-    pub fn delete_messages_before(
-        &self,
-        session_id: &str,
-        before_order: i64,
-    ) -> Result<usize, StorageError> {
         let conn = self.conn.lock().unwrap();
-        let count = conn.execute(
-            "DELETE FROM messages WHERE session_id = ?1 AND sort_order < ?2",
-            params![session_id, before_order],
+        let mut stmt = conn.prepare(
+            "SELECT id, role, content, timestamp, tool_calls, tool_call_id FROM messages
+             WHERE session_id = ?1 ORDER BY sort_order DESC LIMIT ?2",
         )?;
-        Ok(count)
+        let rows = stmt.query_map(params![session_id, limit as i64], |row| {
+            let id_str: String = row.get(0)?;
+            let role_str: String = row.get(1)?;
+            let content: String = row.get(2)?;
+            let ts_str: String = row.get(3)?;
+            let tool_calls_json: Option<String> = row.get(4)?;
+            let tool_call_id: Option<String> = row.get(5)?;
+
+            let role = match role_str.as_str() {
+                "user" => Role::User,
+                "assistant" => Role::Assistant,
+                "system" => Role::System,
+                _ => Role::Tool,
+            };
+            let timestamp = chrono::DateTime::parse_from_rfc3339(&ts_str)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now());
+            let tool_calls = tool_calls_json
+                .and_then(|json| serde_json::from_str(&json).ok());
+
+            Ok(Message {
+                id: uuid::Uuid::parse_str(&id_str).unwrap_or_else(|_| uuid::Uuid::new_v4()),
+                role,
+                content,
+                timestamp,
+                tool_calls,
+                tool_call_id,
+            })
+        })?;
+        let mut messages: Vec<Message> = rows.collect::<Result<Vec<_>, _>>()?;
+        messages.reverse(); // DESC → chronological order
+        Ok(messages)
     }
 
     /// Get the total number of messages in a session.
@@ -445,30 +375,50 @@ impl Storage {
 
     pub fn save_summary(
         &self,
-        session_id: &str,
+        conversation_id: &str,
         content: &str,
         message_range: &str,
     ) -> Result<String, StorageError> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
         self.conn.lock().unwrap().execute(
-            "INSERT INTO summaries (id, session_id, content, message_range, created_at)
+            "INSERT INTO summaries (id, conversation_id, content, message_range, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id, session_id, content, message_range, now],
+            params![id, conversation_id, content, message_range, now],
         )?;
         Ok(id)
     }
 
-    pub fn get_summaries(&self, session_id: &str) -> Result<Vec<Summary>, StorageError> {
+    pub fn get_summaries(&self, conversation_id: &str) -> Result<Vec<Summary>, StorageError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, session_id, content, message_range, created_at
-             FROM summaries WHERE session_id = ?1 ORDER BY created_at",
+            "SELECT id, conversation_id, content, message_range, created_at
+             FROM summaries WHERE conversation_id = ?1 ORDER BY created_at",
         )?;
-        let rows = stmt.query_map(params![session_id], |row| {
+        let rows = stmt.query_map(params![conversation_id], |row| {
             Ok(Summary {
                 id: row.get(0)?,
-                session_id: row.get(1)?,
+                conversation_id: row.get(1)?,
+                content: row.get(2)?,
+                message_range: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Search summaries by keyword across all conversations.
+    pub fn search_summaries(&self, query: &str, offset: i64, limit: i64) -> Result<Vec<Summary>, StorageError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, conversation_id, content, message_range, created_at
+             FROM summaries WHERE content LIKE ?1 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
+        )?;
+        let pattern = format!("%{query}%");
+        let rows = stmt.query_map(params![pattern, limit, offset], |row| {
+            Ok(Summary {
+                id: row.get(0)?,
+                conversation_id: row.get(1)?,
                 content: row.get(2)?,
                 message_range: row.get(3)?,
                 created_at: row.get(4)?,
@@ -781,7 +731,7 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 #[derive(Debug, Clone)]
 pub struct Summary {
     pub id: String,
-    pub session_id: String,
+    pub conversation_id: String,
     pub content: String,
     pub message_range: String,
     pub created_at: String,

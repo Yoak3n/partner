@@ -41,11 +41,6 @@ impl Runtime {
         self.conversation.push(user_msg.clone());
         let order = self.conversation.messages.len() as i64 - 1;
         let _ = self.storage.save_message(&self.session_id, &self.conversation_id, &user_msg, order);
-        // Also write user message to session file immediately
-        let _ = self.storage.save_session_file(
-            &self.session_id,
-            &self.conversation.messages,
-        );
 
         self.active_skills = self
             .skill_selector
@@ -178,11 +173,6 @@ impl Runtime {
                     self.conversation.push(msg.clone());
                     let order = self.conversation.messages.len() as i64 - 1;
                     let _ = self.storage.save_message(&self.session_id, &self.conversation_id, &msg, order);
-                    // Save full session history to file (for UI rendering)
-                    let _ = self.storage.save_session_file(
-                        &self.session_id,
-                        &self.conversation.messages,
-                    );
                     self.generate_and_store_summary();
                     self.state = AgentState::Idle;
                     return;
@@ -207,9 +197,13 @@ impl Runtime {
         let mut msgs = Vec::new();
 
         let mut prompt_parts = Vec::new();
+
         if let Some(ref sys_prompt) = self.system_prompt {
             prompt_parts.push(sys_prompt.clone());
         }
+
+        // 环境信息后置，优先级低于角色和工作空间定义
+        prompt_parts.push(self.build_environment_context());
 
         if !self.active_skills.is_empty() {
             let summaries: Vec<String> = self.active_skills.iter().map(|s| s.summary()).collect();
@@ -224,6 +218,35 @@ impl Runtime {
         }
         msgs.extend(self.conversation.messages.clone());
         msgs
+    }
+
+    fn build_environment_context(&self) -> String {
+        let now = chrono::Local::now();
+        let os = std::env::consts::OS;
+        let arch = std::env::consts::ARCH;
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
+        let workspace = self.workspace.as_ref()
+            .map(|ws| ws.root().display().to_string())
+            .unwrap_or_else(|| "not initialized".to_string());
+
+        format!(
+            "# Runtime Environment\n\
+             - OS: {} ({})\n\
+             - Working directory: {}\n\
+             - Workspace: {}\n\
+             - Current time: {}\n\
+             - Timezone: UTC{}\n\
+             - Conversation ID: {}",
+            os,
+            arch,
+            cwd,
+            workspace,
+            now.format("%Y-%m-%d %H:%M:%S"),
+            now.format("%:z"),
+            self.conversation_id,
+        )
     }
 
     fn select_provider(&self) -> Option<&ModelProvider> {
@@ -260,7 +283,7 @@ impl Runtime {
         let msg_range = format!("0-{}", messages.len().saturating_sub(1));
 
         let summary_id = match self.storage.save_summary(
-            &self.session_id,
+            &self.conversation_id,
             &summary_content,
             &msg_range,
         ) {

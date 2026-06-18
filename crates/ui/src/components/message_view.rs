@@ -1,4 +1,4 @@
-use iced::widget::{column, container, mouse_area, text};
+use iced::widget::{container, mouse_area, text};
 use iced::{Color, Element, Length};
 
 use ai_partner_shared::{Message, Role};

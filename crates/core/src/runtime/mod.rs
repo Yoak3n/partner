@@ -4,7 +4,7 @@ pub(crate) mod selector;
 pub(crate) mod tools;
 
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
 use ai_partner_shared::{
     AgentEvent, AppConfig, ModelKind, Skill, Storage, ToolDefinition,
@@ -49,6 +49,7 @@ pub struct Runtime {
     pub(crate) rate_limiter: RateLimiter,
     pub(crate) storage: Arc<Storage>,
     pub(crate) subagent_registry: SubAgentRegistry,
+    pub(crate) diary_path: Arc<Mutex<std::path::PathBuf>>,
 }
 
 impl Runtime {
@@ -92,6 +93,14 @@ impl Runtime {
             .find(|p| p.enabled)
             .map(|p| create_embedding_adapter(p));
 
+        // Default diary path: {CWD}/.ai-partner/memory/diary
+        let default_diary = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join(".ai-partner")
+            .join("memory")
+            .join("diary");
+        let diary_path = Arc::new(Mutex::new(default_diary));
+
         let mut runtime = Self {
             agent,
             app_config,
@@ -115,6 +124,7 @@ impl Runtime {
             rate_limiter,
             storage,
             subagent_registry: SubAgentRegistry::new(),
+            diary_path: diary_path.clone(),
         };
 
         register_builtins(&mut runtime.tool_registry, event_tx);
@@ -128,10 +138,12 @@ impl Runtime {
             CompactionAgent::new(runtime.agent.adapter()),
         );
         runtime.subagent_registry.register_arc(compaction_agent.clone());
+
         runtime.hooks.push(Box::new(CompactionHook::new(
             ConversationManager::new(runtime.storage.clone()),
             compaction_agent,
             Arc::new(runtime.app_config.clone()),
+            runtime.diary_path.clone(),
         )));
 
         runtime
@@ -170,9 +182,23 @@ impl Runtime {
         &mut self.mcp_manager
     }
 
-    pub fn set_workspace(&mut self, config: WorkspaceConfig) {
+    pub async fn set_workspace(&mut self, config: WorkspaceConfig) {
+        let used_default = config.is_none();
         match Workspace::from_config(config) {
             Ok(ws) => {
+                // Update diary path to workspace memory directory
+                let new_diary = ws.memory_path().join("diary");
+                *self.diary_path.lock().await = new_diary;
+
+                // If using default path, persist it to config so the agent knows the location
+                if used_default {
+                    let resolved = ws.root().display().to_string();
+                    self.app_config.workspace = Some(resolved);
+                    if let Err(e) = self.app_config.save() {
+                        log::warn!("failed to save workspace path to config: {e}");
+                    }
+                }
+
                 self.available_skills = ws.load_skills();
                 log::info!("loaded {} skills from workspace", self.available_skills.len());
                 // Rebuild system prompt with workspace instruction files
@@ -328,11 +354,8 @@ impl Runtime {
         self.conversation.clear();
         self.conversation_id = session_id.to_string();
 
-        // 使用分页加载，只加载最近的 50 条消息
-        const INITIAL_LOAD_LIMIT: usize = 50;
-        
-        match self.storage.load_session_file_paginated(session_id, INITIAL_LOAD_LIMIT) {
-            Ok(messages) if !messages.is_empty() => {
+        match self.conversation_manager.load_recent(session_id) {
+            Ok(messages) => {
                 for msg in &messages {
                     self.conversation.push(msg.clone());
                 }
@@ -342,51 +365,9 @@ impl Runtime {
                     messages,
                 });
             }
-            _ => {
-                // Fall back to database
-                match self.conversation_manager.load_recent(session_id) {
-                    Ok(messages) => {
-                        let _ = self.storage.save_session_file(session_id, &messages);
-                        for msg in &messages {
-                            self.conversation.push(msg.clone());
-                        }
-                        let _ = self.event_tx.send(AgentEvent::SessionSwitched(session_id.to_string()));
-                        let _ = self.event_tx.send(AgentEvent::MessagesLoaded {
-                            session_id: session_id.to_string(),
-                            messages,
-                        });
-                    }
-                    Err(e) => {
-                        log::warn!("failed to load session {session_id}: {e}");
-                        let _ = self.event_tx.send(AgentEvent::Error(format!("加载会话失败: {e}")));
-                    }
-                }
-            }
-        }
-    }
-
-    /// Load more messages for infinite scroll
-    pub fn load_more_messages(&self, session_id: &str, before_index: usize) {
-        const LOAD_MORE_LIMIT: usize = 30;
-        
-        match self.storage.load_messages_before(session_id, before_index, LOAD_MORE_LIMIT) {
-            Ok(messages) if !messages.is_empty() => {
-                let _ = self.event_tx.send(AgentEvent::MoreMessagesLoaded {
-                    session_id: session_id.to_string(),
-                    messages,
-                    has_more: before_index > LOAD_MORE_LIMIT,
-                });
-            }
-            Ok(_) => {
-                // No more messages
-                let _ = self.event_tx.send(AgentEvent::MoreMessagesLoaded {
-                    session_id: session_id.to_string(),
-                    messages: Vec::new(),
-                    has_more: false,
-                });
-            }
             Err(e) => {
-                log::warn!("failed to load more messages: {e}");
+                log::warn!("failed to load session {session_id}: {e}");
+                let _ = self.event_tx.send(AgentEvent::Error(format!("加载会话失败: {e}")));
             }
         }
     }

@@ -1,6 +1,34 @@
 use std::sync::Arc;
 
 use ai_partner_shared::{Message, Role, Storage};
+use serde_json::Value;
+
+/// Truncate string values inside a JSON object to `max_chars` per value.
+/// Preserves structure (keys, numbers, bools, nulls) — only string payloads are cut.
+fn truncate_json_values(value: &Value, max_chars: usize) -> Value {
+    match value {
+        Value::String(s) => {
+            let truncated: String = s.chars().take(max_chars).collect();
+            if truncated.len() < s.len() {
+                Value::String(format!("{}...", truncated))
+            } else {
+                Value::String(truncated)
+            }
+        }
+        Value::Array(arr) => {
+            Value::Array(arr.iter().map(|v| truncate_json_values(v, max_chars)).collect())
+        }
+        Value::Object(map) => {
+            let truncated: serde_json::Map<String, Value> = map
+                .iter()
+                .map(|(k, v)| (k.clone(), truncate_json_values(v, max_chars)))
+                .collect();
+            Value::Object(truncated)
+        }
+        // numbers, bools, null — pass through
+        other => other.clone(),
+    }
+}
 
 /// Manages conversation lifecycle: history loading, tool message compression,
 /// and message eviction when the conversation grows too long.
@@ -25,8 +53,9 @@ impl ConversationManager {
     }
 
     /// Load recent messages from the database, compressing tool-related content.
+    /// Only loads up to `max_messages` to avoid immediately triggering compaction.
     pub fn load_recent(&self, session_id: &str) -> Result<Vec<Message>, String> {
-        let messages = self.storage.load_messages(session_id)
+        let messages = self.storage.load_messages_recent(session_id, self.max_messages)
             .map_err(|e| format!("failed to load messages: {e}"))?;
 
         Ok(messages.iter().map(|m| self.compress_message(m)).collect())
@@ -116,9 +145,20 @@ impl ConversationManager {
                 }
             }
             Role::Assistant if msg.tool_calls.is_some() => {
-                // Keep tool_calls structure (LLM needs it), clear content
+                // Keep tool_calls structure, clear content, truncate arguments
+                let tool_calls = msg.tool_calls.as_ref().map(|calls| {
+                    calls
+                        .iter()
+                        .map(|tc| ai_partner_shared::ToolCall {
+                            id: tc.id.clone(),
+                            name: tc.name.clone(),
+                            arguments: truncate_json_values(&tc.arguments, self.tool_result_truncate),
+                        })
+                        .collect()
+                });
                 Message {
                     content: String::new(),
+                    tool_calls,
                     ..msg.clone()
                 }
             }

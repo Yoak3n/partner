@@ -63,3 +63,9 @@ pub fn bring_to_foreground(title: &str) {
 
 #[cfg(not(target_os = "windows"))]
 pub fn set_rounded_corners_for_title(_title: &str) {}
+
+#[cfg(not(target_os = "windows"))]
+pub fn hide_window(_title: &str) {}
+
+#[cfg(not(target_os = "windows"))]
+pub fn bring_to_foreground(_title: &str) {}

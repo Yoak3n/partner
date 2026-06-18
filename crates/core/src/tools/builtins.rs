@@ -140,18 +140,28 @@ pub fn register_memory_manage(
                     let entry = db.get_memory(id)
                         .map_err(|e| format!("failed to get memory: {e}"))?
                         .ok_or_else(|| format!("memory '{id}' not found"))?;
-                    let session_id = entry.session_id
+                    let sid = entry.session_id
                         .as_deref()
                         .ok_or_else(|| format!("memory '{id}' has no associated session"))?;
-                    let messages = db.load_messages(session_id)
+                    let limit = args["limit"].as_i64().unwrap_or(30) as usize;
+                    let page = args["page"].as_i64().unwrap_or(1).max(1) as usize;
+                    let messages = db.load_messages(sid)
                         .map_err(|e| format!("failed to load session: {e}"))?;
                     if messages.is_empty() {
-                        return Ok(format!("session {session_id} has no messages"));
+                        return Ok(format!("session {sid} has no messages"));
                     }
-                    let lines: Vec<String> = messages.iter().map(|m| {
-                        format!("[{}] {:?}: {}", &m.id.to_string()[..8], m.role, m.content)
+                    let total = messages.len();
+                    let start = (page - 1) * limit;
+                    if start >= total {
+                        return Ok(format!("page {page} out of range (total {total} messages)"));
+                    }
+                    let end = (start + limit).min(total);
+                    let lines: Vec<String> = messages[start..end].iter().map(|m| {
+                        let content = compact_content(&m.content);
+                        format!("[{}] {:?}: {}", &m.id.to_string()[..8], m.role, content)
                     }).collect();
-                    Ok(format!("session: {}\n---\n{}", session_id, lines.join("\n")))
+                    let header = format!("session: {} (page {page}, showing {}-{}/{})", sid, start + 1, end, total);
+                    Ok(format!("{}\n---\n{}", header, lines.join("\n")))
                 }
                 "list" => {
                     let limit = args["limit"].as_i64().unwrap_or(20);
@@ -227,10 +237,54 @@ pub fn register_memory_manage(
                     }).collect();
                     Ok(format!("RAG results ({}):\n{}", results.len(), lines.join("\n---\n")))
                 }
-                _ => Err(format!("unknown action '{action}', use: save, activate, load, list, search, delete, query")),
+                "find_conversation_from_summary" => {
+                    let query = args["query"]
+                        .as_str()
+                        .ok_or("missing 'query' for find_conversation_from_summary")?;
+                    let limit = args["limit"].as_i64().unwrap_or(10);
+                    let page = args["page"].as_i64().unwrap_or(1).max(1);
+                    let offset = (page - 1) * limit;
+                    let entries = db.search_summaries(query, offset, limit)
+                        .map_err(|e| format!("failed to search summaries: {e}"))?;
+                    if entries.is_empty() {
+                        return Ok(format!("no summaries matching '{query}'"));
+                    }
+                    let lines: Vec<String> = entries.iter().map(|s| {
+                        let preview: String = s.content.chars().take(200).collect();
+                        format!("[{}] conversation:{} | {}\n{}",
+                            &s.id[..8.min(s.id.len())],
+                            &s.conversation_id[..8.min(s.conversation_id.len())],
+                            s.created_at,
+                            preview)
+                    }).collect();
+                    Ok(format!("summaries ({}):\n{}", entries.len(), lines.join("\n---\n")))
+                }
+                _ => Err(format!("unknown action '{action}', use: save, activate, load, list, search, delete, query, find_conversation_from_summary")),
             }
         })
     });
+}
+
+/// Compact message content for display in load results.
+/// Truncates long tool_call payloads and plain text to save context.
+fn compact_content(content: &str) -> String {
+    const MAX_LEN: usize = 300;
+    if content.len() <= MAX_LEN {
+        return content.to_string();
+    }
+    // Try to detect JSON-like tool_call content and summarize
+    if content.starts_with('{') || content.starts_with('[') {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
+            // For tool_use blocks, just show the tool name + truncated input
+            if let Some(name) = v.get("name").and_then(|n| n.as_str()) {
+                let input = v.get("input").map(|i| i.to_string()).unwrap_or_default();
+                let truncated: String = input.chars().take(100).collect();
+                return format!("{{\"name\":\"{name}\",\"input\":\"{truncated}...\"}}");
+            }
+        }
+    }
+    let truncated: String = content.chars().take(MAX_LEN).collect();
+    format!("{truncated}...")
 }
 
 fn format_memory(e: &MemoryEntry) -> String {
@@ -352,13 +406,13 @@ fn run_command_def() -> ToolDefinition {
 fn memory_manage_def() -> ToolDefinition {
     ToolDefinition {
         name: "memory_manage".into(),
-        description: "Manage persistent memories with weighted forgetting curve. Actions: save (create/update), activate (read content + boost weight), load (load conversation by memory id), list (all by weight), search (text match), delete, query (RAG vector similarity search). Unused memories decay over time.".into(),
+        description: "Manage persistent memories with weighted forgetting curve. Actions: save (create/update), activate (read content + boost weight), load (load conversation by memory id), list (all by weight), search (text match), delete, query (RAG vector similarity search), find_conversation_from_summary (search conversation summaries to find conversation_id). Unused memories decay over time.".into(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["save", "load", "list", "search", "activate", "delete", "query"],
+                    "enum": ["save", "load", "list", "search", "activate", "delete", "query", "find_conversation_from_summary"],
                     "description": "Operation to perform"
                 },
                 "id": {

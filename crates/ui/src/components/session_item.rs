@@ -1,4 +1,4 @@
-use iced::widget::{column, container, mouse_area, row, text, Space};
+use iced::widget::{column, container, mouse_area, row, text};
 use iced::{Color, Element, Length};
 
 use ai_partner_shared::SessionSummary;

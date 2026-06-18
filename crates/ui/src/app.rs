@@ -3,7 +3,7 @@ use iced::{clipboard, Color, Element, Length, Subscription, Task, Theme};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-use ai_partner_shared::{AgentEvent, Message, SessionSummary, Storage};
+use ai_partner_shared::{AgentEvent, Message, SessionSummary};
 
 use crate::components::{message_view, title_bar};
 use crate::runtime_bridge::{self, RuntimeCommand};
@@ -20,7 +20,6 @@ pub struct App {
     sessions: Vec<SessionSummary>,
     show_sidebar: bool,
     cmd_tx: mpsc::UnboundedSender<RuntimeCommand>,
-    storage: Storage, // 复用 Storage 实例
 }
 
 #[derive(Debug, Clone)]
@@ -69,8 +68,6 @@ impl App {
             |_| AppEvent::Noop,
         );
 
-        let storage = Storage::new().expect("Failed to init storage");
-
         (
             Self {
                 input: String::new(),
@@ -83,7 +80,6 @@ impl App {
                 sessions: Vec::new(),
                 show_sidebar: true,
                 cmd_tx,
-                storage,
             },
             setup,
         )
@@ -161,15 +157,22 @@ impl App {
     fn handle_window(event: AppEvent) -> Task<AppEvent> {
         match event {
             AppEvent::WindowClose => {
-                eprintln!("[app] WindowClose triggered");
-                with_latest_window(|id| iced::window::close(id))
+                #[cfg(windows)]
+                {
+                    // Windows: 隐藏窗口到托盘，而不是关闭
+                    with_latest_window(|id| iced::window::set_mode(id, iced::window::Mode::Hidden))
+                }
+                #[cfg(not(windows))]
+                {
+                    // Linux (niri/Wayland): 直接关闭窗口
+                    with_latest_window(|id| iced::window::close(id))
+                }
             }
             AppEvent::WindowMaximizeToggle => {
                 with_latest_window(|id| iced::window::toggle_maximize(id))
             }
             AppEvent::WindowMinimize => {
-                eprintln!("[app] WindowMinimize triggered");
-                with_latest_window(|id| iced::window::close(id))
+                with_latest_window(|id| iced::window::minimize(id, true))
             }
             AppEvent::WindowDrag => with_latest_window(|id| iced::window::drag(id)),
             _ => unreachable!(),
@@ -178,7 +181,10 @@ impl App {
 
     fn handle_tray(event: TrayEvent) -> Task<AppEvent> {
         match event {
-            TrayEvent::Show => with_latest_window(|id| iced::window::gain_focus(id)),
+            TrayEvent::Show => with_latest_window(|id| {
+                iced::window::set_mode(id, iced::window::Mode::Windowed)
+                    .chain(iced::window::gain_focus(id))
+            }),
             TrayEvent::Quit => iced::exit(),
         }
     }
@@ -214,18 +220,8 @@ impl App {
                 Task::none()
             }
             AppEvent::SwitchSession(id) => {
-                match self.storage.load_session_file_paginated(&id, 50) {
-                    Ok(messages) => {
-                        self.session_id = Some(id);
-                        self.messages = messages;
-                        self.loading_session_id = None;
-                        self.show_sidebar = false;
-                    }
-                    Err(e) => {
-                        self.messages.push(Message::system(format!("[Error] 加载失败: {e}")));
-                        self.loading_session_id = None;
-                    }
-                }
+                self.loading_session_id = Some(id.clone());
+                let _ = self.cmd_tx.send(RuntimeCommand::SwitchSession(id));
                 Task::none()
             }
             AppEvent::DeleteSession(id) => {
@@ -464,7 +460,7 @@ impl App {
 
     pub fn subscription(&self) -> Subscription<AppEvent> {
         use futures::stream;
-        Subscription::batch([
+        let mut subs = vec![
             Subscription::run(|| {
                 stream::unfold((), |()| async {
                     let evt = runtime_bridge::recv_event().await;
@@ -477,7 +473,11 @@ impl App {
                     Some((AppEvent::TrayEvent(evt), ()))
                 })
             }),
-        ])
+        ];
+        // Windows: 拦截系统级关闭请求（如 Alt+F4），隐藏到托盘而非退出
+        #[cfg(windows)]
+        subs.push(iced::window::close_requests().map(|_| AppEvent::WindowClose));
+        Subscription::batch(subs)
     }
 
     pub fn theme(&self) -> Theme {

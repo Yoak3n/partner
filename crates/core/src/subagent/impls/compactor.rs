@@ -1,7 +1,8 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
 use ai_partner_shared::{AgentEvent, AppConfig, Message, ModelKind};
 
@@ -86,12 +87,13 @@ impl SubAgent for CompactionAgent {
 /// When the message list exceeds `max_messages`, the hook:
 /// 1. Evicts the oldest messages (keeping the most recent `min_recent_messages`)
 /// 2. Sends evicted messages to the compaction sub-agent for summarization
-/// 3. Replaces evicted messages with a single assistant summary message
-/// 4. Persists the changes (deletes old messages from DB)
+/// 3. Persists the summary to the diary file (injected as system context)
+/// 4. Keeps only the recent messages in the message list
 pub struct CompactionHook {
     manager: ConversationManager,
     compactor: Arc<dyn SubAgent>,
     app_config: Arc<AppConfig>,
+    diary_path: Arc<Mutex<PathBuf>>,
 }
 
 impl CompactionHook {
@@ -99,11 +101,13 @@ impl CompactionHook {
         manager: ConversationManager,
         compactor: Arc<dyn SubAgent>,
         app_config: Arc<AppConfig>,
+        diary_path: Arc<Mutex<PathBuf>>,
     ) -> Self {
         Self {
             manager,
             compactor,
             app_config,
+            diary_path,
         }
     }
 }
@@ -142,30 +146,74 @@ impl AgentHook for CompactionHook {
 
         let result = self.compactor.execute(&prompt, sub_ctx).await;
 
-        let summary_msg = Message::assistant(&format!(
-            "[Compacted history summary]\n{}",
-            result.output
-        ));
+        // Persist summary to diary file
+        self.append_to_diary(&result.output, evicted.len()).await;
 
-        let mut new_messages = Vec::with_capacity(kept.len() + 1);
-        new_messages.push(summary_msg);
-        new_messages.extend(kept);
-        *messages = new_messages;
-
-        let boundary = evicted.len() as i64;
-        if let Err(e) = self
-            .manager
-            .storage_ref()
-            .delete_messages_before(ctx.session_id, boundary)
-        {
-            log::warn!("failed to delete compacted messages: {e}");
-        }
+        // Keep only recent messages — summary is in the diary, not in the message list
+        *messages = kept;
 
         log::info!(
-            "compaction complete: {} messages replaced with summary",
+            "compaction complete: {} evicted, diary updated",
             evicted.len()
         );
 
         HookResult::Continue
+    }
+}
+
+impl CompactionHook {
+    async fn append_to_diary(&self, summary: &str, message_count: usize) {
+        let diary_path = self.diary_path.lock().await.clone();
+
+        if let Err(e) = std::fs::create_dir_all(&diary_path) {
+            log::warn!("failed to create diary directory: {e}");
+            return;
+        }
+
+        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let time = chrono::Local::now().format("%H:%M").to_string();
+
+        let entry = format!(
+            "### [{}] Compacted {} messages\n\n{}\n\n",
+            time, message_count, summary
+        );
+
+        let path = diary_path.join(format!("{date}.md"));
+
+        // Ensure file has section headers on first write
+        if !path.exists() {
+            let init = "# Agent Notes\n\n\n\n---\n\n# Compact History\n\n";
+            if let Err(e) = std::fs::write(&path, init) {
+                log::warn!("failed to init diary file: {e}");
+                return;
+            }
+        }
+
+        // Insert entry after "# Compact History" header
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("failed to read diary file: {e}");
+                return;
+            }
+        };
+
+        let marker = "# Compact History\n";
+        let new_content = if let Some(pos) = content.find(marker) {
+            let insert_at = pos + marker.len();
+            let mut result = String::with_capacity(content.len() + entry.len());
+            result.push_str(&content[..insert_at]);
+            result.push('\n');
+            result.push_str(&entry);
+            result.push_str(&content[insert_at..]);
+            result
+        } else {
+            // Fallback: prepend
+            format!("{}\n{}", entry, content)
+        };
+
+        if let Err(e) = std::fs::write(&path, &new_content) {
+            log::warn!("failed to write diary entry: {e}");
+        }
     }
 }

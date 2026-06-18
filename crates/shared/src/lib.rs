@@ -9,6 +9,6 @@ pub mod storage;
 pub use message::{Message, Role};
 pub use event::{AgentEvent, ProcessStatus};
 pub use tool::{ToolDefinition, ToolCall};
-pub use config::{AppConfig, ConfigError, McpServerConfig, ModelKind, ModelProvider, ProviderGroup, WorkspaceConfig, load_system_prompt, system_prompt_path};
+pub use config::{AppConfig, ConfigError, McpServerConfig, ModelKind, ModelProvider, ProviderGroup, WorkspaceConfig, load_system_prompt};
 pub use skill::{Skill, SkillError};
 pub use storage::{Storage, StorageError, SessionSummary, ConversationInfo, Summary, Document, DocumentSearchResult, MemoryEntry};

@@ -32,9 +32,10 @@ pub fn init_runtime() -> mpsc::UnboundedSender<RuntimeCommand> {
         let storage = Storage::new().expect("Failed to init storage");
         let adapter = OpenAIAdapter::new();
         let agent = Agent::new(adapter);
-        let runtime = Runtime::new(agent, app_config, storage, event_tx);
+        let mut runtime = Runtime::new(agent, app_config.clone(), storage, event_tx);
 
         let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(runtime.set_workspace(app_config.workspace));
         rt.block_on(runtime_loop(runtime, cmd_rx));
     });
 
